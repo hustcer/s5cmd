@@ -2,8 +2,11 @@ package storage
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -16,7 +19,8 @@ import (
 
 // Filesystem is the Storage implementation of a local filesystem.
 type Filesystem struct {
-	dryRun bool
+	dryRun      bool
+	cacheHashes bool // Enable hash caching for performance
 }
 
 // Stat returns the Object structure describing object.
@@ -30,13 +34,49 @@ func (f *Filesystem) Stat(ctx context.Context, url *url.URL) (*Object, error) {
 	}
 
 	mod := st.ModTime()
-	return &Object{
+	obj := &Object{
 		URL:     url,
 		Type:    ObjectType{st.Mode()},
 		Size:    st.Size(),
 		ModTime: &mod,
 		Etag:    "",
-	}, nil
+	}
+
+	// Calculate MD5 hash for regular files when hash caching is enabled
+	// This improves performance by avoiding repeated hash calculations during sync operations
+	if f.cacheHashes && obj.Type.IsRegular() && obj.Size > 0 {
+		if hash, err := f.calculateMD5Hash(url.Absolute()); err == nil {
+			obj.Etag = hash
+		}
+		// If hash calculation fails, leave Etag empty - getHash() will handle it
+	}
+
+	return obj, nil
+}
+
+// calculateMD5Hash computes the MD5 hash of a file
+// This is used to populate the ETag field for local files when hash caching is enabled
+func (f *Filesystem) calculateMD5Hash(filePath string) (string, error) {
+	file, err := os.OpenFile(filePath, os.O_RDONLY, 0644)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			// Intentionally ignore close errors as this is best-effort
+			_ = closeErr
+		}
+	}()
+
+	md5Obj := md5.New()
+	// Use fixed buffer size to prevent OOM for large files
+	const bufferSize = 32 * 1024 // 32KB chunks
+	buf := make([]byte, bufferSize)
+	if _, err := io.CopyBuffer(md5Obj, file, buf); err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(md5Obj.Sum(nil)), nil
 }
 
 // List returns the objects and directories reside in given src.

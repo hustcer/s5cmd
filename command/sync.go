@@ -163,6 +163,12 @@ type Sync struct {
 
 // NewSync creates Sync from cli.Context
 func NewSync(c *cli.Context) Sync {
+	storageOpts := NewStorageOpts(c)
+	// Enable hash caching for hash-only sync operations to improve performance
+	if c.Bool("hash-only") {
+		storageOpts.CacheHashes = true
+	}
+
 	return Sync{
 		src:         c.Args().Get(0),
 		dst:         c.Args().Get(1),
@@ -184,7 +190,7 @@ func NewSync(c *cli.Context) Sync {
 		// region settings
 		srcRegion:   c.String("source-region"),
 		dstRegion:   c.String("destination-region"),
-		storageOpts: NewStorageOpts(c),
+		storageOpts: storageOpts,
 	}
 }
 

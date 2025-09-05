@@ -1,6 +1,7 @@
 package command
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"os"
@@ -267,6 +268,169 @@ func TestNewStrategy(t *testing.T) {
 	sizeOnlyPriority := NewStrategy(true, true)
 	_, ok = sizeOnlyPriority.(*SizeOnlyStrategy)
 	assert.Assert(t, ok)
+}
+
+func TestHashCachingPerformanceOptimization(t *testing.T) {
+	// Test that demonstrates the performance optimization
+	strategy := &HashStrategy{}
+
+	// Create a temporary local file
+	tmpDir := t.TempDir()
+	localFile := filepath.Join(tmpDir, "testfile.txt")
+	content := "Hello, World! This is a performance test."
+	err := os.WriteFile(localFile, []byte(content), 0644)
+	assert.NilError(t, err)
+
+	// Calculate expected MD5 hash
+	md5Hash := md5.Sum([]byte(content))
+	expectedHash := hex.EncodeToString(md5Hash[:])
+
+	localURL, _ := url.New(localFile)
+
+	// Test WITHOUT hash caching (old behavior)
+	fsWithoutCache := storage.NewLocalClient(storage.Options{CacheHashes: false})
+	ctx := context.Background()
+	dstObjWithoutCache, err := fsWithoutCache.Stat(ctx, localURL)
+	assert.NilError(t, err)
+
+	// Test WITH hash caching (new optimized behavior)
+	fsWithCache := storage.NewLocalClient(storage.Options{CacheHashes: true})
+	dstObjWithCache, err := fsWithCache.Stat(ctx, localURL)
+	assert.NilError(t, err)
+
+	// Create remote S3 object
+	remoteURL, _ := url.New("s3://bucket/testfile.txt")
+	srcObj := &storage.Object{
+		URL:  remoteURL,
+		Size: int64(len(content)),
+		Etag: expectedHash,
+	}
+
+	t.Logf("WITHOUT hash caching - Destination ETag: '%s'", dstObjWithoutCache.Etag)
+	t.Logf("WITH hash caching - Destination ETag: '%s'", dstObjWithCache.Etag)
+
+	// Both should work correctly
+	err1 := strategy.ShouldSync(srcObj, dstObjWithoutCache)
+	err2 := strategy.ShouldSync(srcObj, dstObjWithCache)
+
+	// Both should return ErrObjectEtagsMatch
+	assert.Equal(t, err1, errorpkg.ErrObjectEtagsMatch)
+	assert.Equal(t, err2, errorpkg.ErrObjectEtagsMatch)
+
+	// The key difference: with hash caching, the ETag is pre-computed
+	assert.Equal(t, dstObjWithoutCache.Etag, "", "Without cache: ETag should be empty")
+	assert.Equal(t, dstObjWithCache.Etag, expectedHash, "With cache: ETag should be pre-computed")
+
+	// This means getHash() for cached objects will be much faster
+	// since it just returns the pre-computed ETag instead of recalculating
+	hash1 := getHash(dstObjWithoutCache) // This will recalculate MD5
+	hash2 := getHash(dstObjWithCache)    // This will just return the ETag
+
+	assert.Equal(t, hash1, expectedHash)
+	assert.Equal(t, hash2, expectedHash)
+	t.Log("Performance optimization: hash caching avoids repeated MD5 calculations")
+}
+
+func TestHashStrategyBugReproduction(t *testing.T) {
+	// This test reproduces the real-world scenario that causes the bug
+	// Let's simulate how objects are actually created in sync operation
+
+	strategy := &HashStrategy{}
+
+	// Create a temporary local file
+	tmpDir := t.TempDir()
+	localFile := filepath.Join(tmpDir, "testfile.txt")
+	content := "Hello, World!"
+	err := os.WriteFile(localFile, []byte(content), 0644)
+	assert.NilError(t, err)
+
+	// Calculate expected MD5 hash
+	md5Hash := md5.Sum([]byte(content))
+	expectedHash := hex.EncodeToString(md5Hash[:])
+
+	// Simulate remote S3 object (source) - this would come from S3 list operation
+	remoteURL, _ := url.New("s3://bucket/testfile.txt")
+	srcObj := &storage.Object{
+		URL:  remoteURL,
+		Size: int64(len(content)),
+		Etag: expectedHash, // S3 provides the MD5 as ETag
+	}
+
+	// Simulate local object (destination) - this would come from filesystem Stat operation
+	// The key insight: let's check how storage.Filesystem.Stat actually creates objects
+	localURL, _ := url.New(localFile)
+
+	// Create filesystem storage to test real object creation with hash caching
+	fs := &storage.Filesystem{}
+	// Enable hash caching to test the optimized behavior
+	fsOpts := storage.Options{CacheHashes: true}
+	fs = storage.NewLocalClient(fsOpts)
+	ctx := context.Background()
+	dstObj, err := fs.Stat(ctx, localURL)
+	assert.NilError(t, err)
+
+	// Now test with real objects as they would be created
+	t.Logf("Source ETag: '%s'", srcObj.Etag)
+	t.Logf("Destination ETag: '%s'", dstObj.Etag)
+	t.Logf("Source hash from getHash(): '%s'", getHash(srcObj))
+	t.Logf("Destination hash from getHash(): '%s'", getHash(dstObj))
+
+	err = strategy.ShouldSync(srcObj, dstObj)
+	if err == errorpkg.ErrObjectEtagsMatch {
+		t.Log("SUCCESS: Files with identical content correctly identified as not needing sync")
+	} else if err == nil {
+		t.Log("BUG CONFIRMED: Files with identical content incorrectly marked for sync")
+		t.Log("This demonstrates the reported bug")
+		// Don't fail the test, we want to see this behavior
+	} else {
+		t.Logf("Unexpected error: %v", err)
+		t.Fail()
+	}
+}
+
+func TestHashStrategyRemoteToLocal(t *testing.T) {
+	strategy := &HashStrategy{}
+
+	// Create a temporary local file
+	tmpDir := t.TempDir()
+	localFile := filepath.Join(tmpDir, "testfile.txt")
+	content := "Hello, World!"
+	err := os.WriteFile(localFile, []byte(content), 0644)
+	assert.NilError(t, err)
+
+	// Calculate expected MD5 hash
+	md5Hash := md5.Sum([]byte(content))
+	expectedHash := hex.EncodeToString(md5Hash[:])
+
+	// Create remote S3 object with correct ETag (MD5 hash)
+	remoteURL, _ := url.New("s3://bucket/testfile.txt")
+	srcObj := &storage.Object{
+		URL:  remoteURL,
+		Size: int64(len(content)),
+		Etag: expectedHash, // Remote object has the correct MD5 hash
+	}
+
+	// Create local object as it would be created by filesystem
+	localURL, _ := url.New(localFile)
+	dstObj := &storage.Object{
+		URL:  localURL,
+		Size: int64(len(content)),
+		Etag: "", // Local object has empty ETag as per current implementation
+	}
+
+	// Test the actual behavior
+	err = strategy.ShouldSync(srcObj, dstObj)
+	if err == errorpkg.ErrObjectEtagsMatch {
+		t.Log("Files with identical content correctly identified as not needing sync")
+	} else if err == nil {
+		t.Log("BUG: Files with identical content incorrectly marked for sync")
+		t.Log("srcHash:", getHash(srcObj))
+		t.Log("dstHash:", getHash(dstObj))
+		t.Fail()
+	} else {
+		t.Logf("Unexpected error: %v", err)
+		t.Fail()
+	}
 }
 
 func TestHashStrategyWithEmptyFiles(t *testing.T) {

@@ -53,7 +53,10 @@ type Storage interface {
 }
 
 func NewLocalClient(opts Options) *Filesystem {
-	return &Filesystem{dryRun: opts.DryRun}
+	return &Filesystem{
+		dryRun:      opts.DryRun,
+		cacheHashes: opts.CacheHashes,
+	}
 }
 
 func NewRemoteClient(ctx context.Context, url *url.URL, opts Options) (*S3, error) {
@@ -99,6 +102,7 @@ type Options struct {
 	bucket                 string
 	region                 string
 	AddressingStyle        string
+	CacheHashes            bool // Enable hash caching for local filesystem operations
 }
 
 func (o *Options) SetRegion(region string) {
